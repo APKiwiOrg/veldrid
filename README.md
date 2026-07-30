@@ -4,7 +4,7 @@ Veldrid is a cross-platform, graphics API-agnostic rendering and compute library
 
 ## APKiwi fork
 
-This fork carries an opt-in Direct3D11 immediate-context recording mode for KhaozEngine. It preserves the upstream deferred-context mode by default. Set `D3D11DeviceOptions.UseImmediateContext` only when a renderer records command lists serially, keeps `Begin`, `End`, and `SubmitCommands` on the same thread, and must avoid the deferred-context recording path.
+This fork carries an opt-in Direct3D11 immediate-context recording mode for KhaozEngine. It preserves the upstream deferred-context mode by default. Its stable `4.9.0.1` package is a vendor revision of upstream `4.9.0`, not an upstream Veldrid release. Set `D3D11DeviceOptions.UseImmediateContext` only when a renderer records command lists serially, keeps `Begin`, `End`, and `SubmitCommands` on the same thread, and must avoid the deferred-context recording path.
 
 Supported backends:
 
