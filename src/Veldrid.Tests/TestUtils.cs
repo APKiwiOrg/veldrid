@@ -285,6 +285,20 @@ namespace Veldrid.Tests
         }
     }
 
+#if TEST_D3D11
+    public class D3D11ImmediateContextDeviceCreator : GraphicsDeviceCreator
+    {
+        public void CreateGraphicsDevice(out Sdl2Window window, out GraphicsDevice gd)
+        {
+            window = null;
+            gd = GraphicsDevice.CreateD3D11(new GraphicsDeviceOptions(true), new D3D11DeviceOptions
+            {
+                UseImmediateContext = true,
+            });
+        }
+    }
+#endif
+
     public class OpenGLDeviceCreator : GraphicsDeviceCreator
     {
         public unsafe void CreateGraphicsDevice(out Sdl2Window window, out GraphicsDevice gd)

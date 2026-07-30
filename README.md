@@ -2,6 +2,10 @@
 
 Veldrid is a cross-platform, graphics API-agnostic rendering and compute library for .NET. It provides a powerful, unified interface to a system's GPU and includes more advanced features than any other .NET library. Unlike other platform- or vendor-specific technologies, Veldrid can be used to create high-performance 3D applications that are truly portable.
 
+## APKiwi fork
+
+This fork carries an opt-in Direct3D11 immediate-context recording mode for KhaozEngine. It preserves the upstream deferred-context mode by default. Set `D3D11DeviceOptions.UseImmediateContext` only when a renderer records command lists serially, keeps `Begin`, `End`, and `SubmitCommands` on the same thread, and must avoid the deferred-context recording path.
+
 Supported backends:
 
 * Direct3D 11
