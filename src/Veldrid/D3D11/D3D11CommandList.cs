@@ -116,12 +116,33 @@ namespace Veldrid.D3D11
 
         public override void Begin()
         {
+            if (_begun)
+            {
+                throw new VeldridException(
+                    "CommandList must be in its initial state, or End() must have been called, for Begin() to be valid to call.");
+            }
+
             _commandList?.Dispose();
             _commandList = null;
             if (_usesImmediateContext)
             {
-                _gd.BeginImmediateContextRecording();
-                _recordingThreadId = Environment.CurrentManagedThreadId;
+                int recordingThreadId = _recordingThreadId;
+                if (recordingThreadId == 0)
+                {
+                    _gd.BeginImmediateContextRecording();
+                    _recordingThreadId = Environment.CurrentManagedThreadId;
+                }
+                else if (recordingThreadId != Environment.CurrentManagedThreadId)
+                {
+                    throw new VeldridException(
+                        "A CommandList created with D3D11DeviceOptions.UseImmediateContext must call Begin(), End(), and "
+                        + "GraphicsDevice.SubmitCommands() from one thread. This CommandList is still recording on another thread.");
+                }
+
+                // Otherwise this command list already holds the recording lock, from an earlier Begin whose
+                // End has not been followed by SubmitCommands yet. That sequence is legal, so do not take the
+                // lock a second time: the extra recursion outlives the single matching Exit at SubmitCommands
+                // and leaves every other thread blocked on the immediate context forever.
             }
 
             try
