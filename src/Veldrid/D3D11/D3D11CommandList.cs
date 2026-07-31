@@ -1439,8 +1439,11 @@ namespace Veldrid.D3D11
                 "The immediate-context recording lock must be released by the thread that took it. "
                 + "Begin, End, and SubmitCommands must all run on one thread when UseImmediateContext is set.");
 
-            _recordingThreadId = 0;
+            // Release first, then clear the owner. Monitor.Exit only throws when this thread does not hold
+            // the lock, and in that case the field has to keep naming the thread that does, so the real owner
+            // can still release it. Clearing first would strand the lock held with nothing left to release it.
             _gd.EndImmediateContextRecording();
+            _recordingThreadId = 0;
         }
 
         private protected override void PushDebugGroupCore(string name)
