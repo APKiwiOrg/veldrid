@@ -20,7 +20,13 @@ namespace Veldrid.D3D11
         private readonly bool _usesImmediateContext;
         private bool _begun;
         private bool _disposed;
-        private bool _immediateContextRecording;
+
+        // Managed thread id of the thread currently holding the immediate-context recording lock on behalf of
+        // this command list, or 0 when this command list does not hold it. Managed thread ids are always
+        // positive, so 0 is a safe "nobody" sentinel. Other threads read this (D3D11Swapchain.Resize calls
+        // Reset from the resizing thread), so it is volatile.
+        private volatile int _recordingThreadId;
+
         private ID3D11CommandList _commandList;
 
         private Viewport[] _viewports = new Viewport[0];
@@ -115,7 +121,7 @@ namespace Veldrid.D3D11
             if (_usesImmediateContext)
             {
                 _gd.BeginImmediateContextRecording();
-                _immediateContextRecording = true;
+                _recordingThreadId = Environment.CurrentManagedThreadId;
             }
 
             try
@@ -231,7 +237,27 @@ namespace Veldrid.D3D11
         {
             if (_usesImmediateContext)
             {
-                if (_begun) _context.ClearState();
+                int recordingThreadId = _recordingThreadId;
+                if (recordingThreadId != 0 && recordingThreadId != Environment.CurrentManagedThreadId)
+                {
+                    // Another thread is recording into the shared immediate context right now. Everything
+                    // below would be wrong from here: ClearState would wipe that thread's in-flight frame,
+                    // ResetManagedState would race its cached state, and EndImmediateContextRecording would
+                    // call Monitor.Exit on a lock this thread does not hold (SynchronizationLockException).
+                    // The recording thread releases the lock itself at End plus SubmitCommands, so there is
+                    // nothing to do and nothing to defer. D3D11Swapchain.Resize reaches this on every window
+                    // resize, so it has to be a silent no-op rather than a throw.
+                    //
+                    // Note this does not make a concurrent resize safe, it only stops Reset from making it
+                    // worse. Resize still disposes the Framebuffer the recording thread has bound, exactly
+                    // as it does in deferred mode. Resize a Swapchain between frames, not during one.
+                    return;
+                }
+
+                if (_begun)
+                {
+                    _context.ClearState();
+                }
             }
             else if (_commandList != null)
             {
@@ -1380,10 +1406,19 @@ namespace Veldrid.D3D11
             }
         }
 
-        void EndImmediateContextRecording()
+        private void EndImmediateContextRecording()
         {
-            if (!_immediateContextRecording) return;
-            _immediateContextRecording = false;
+            if (_recordingThreadId == 0)
+            {
+                return;
+            }
+
+            Debug.Assert(
+                _recordingThreadId == Environment.CurrentManagedThreadId,
+                "The immediate-context recording lock must be released by the thread that took it. "
+                + "Begin, End, and SubmitCommands must all run on one thread when UseImmediateContext is set.");
+
+            _recordingThreadId = 0;
             _gd.EndImmediateContextRecording();
         }
 
