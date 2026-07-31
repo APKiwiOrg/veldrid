@@ -28,6 +28,14 @@ namespace Veldrid.D3D11
         private readonly bool _supportsConcurrentResources;
         private readonly bool _supportsCommandLists;
         private readonly bool _useImmediateContext;
+
+        // Guards every use of the immediate context. Normally held only for the duration of one call. When
+        // D3D11DeviceOptions.UseImmediateContext is set, a D3D11CommandList holds it from Begin all the way to
+        // SubmitCommands instead, which is usually a whole frame, so everything below that locks it (Map,
+        // Unmap, UpdateBuffer, UpdateTexture, SwapBuffers) blocks other threads for that span. It is a Monitor
+        // and therefore reentrant, so the recording thread's own calls pass straight through and land at that
+        // point in the command stream rather than ahead of the frame the way deferred mode puts them. See the
+        // remarks on D3D11DeviceOptions.UseImmediateContext.
         private readonly object _immediateContextLock = new object();
         private readonly BackendInfoD3D11 _d3d11Info;
 
