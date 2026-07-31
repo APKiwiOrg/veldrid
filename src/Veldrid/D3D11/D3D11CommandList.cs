@@ -17,8 +17,10 @@ namespace Veldrid.D3D11
         private readonly ID3D11DeviceContext _context;
         private readonly ID3D11DeviceContext1 _context1;
         private readonly ID3DUserDefinedAnnotation _uda;
+        private readonly bool _usesImmediateContext;
         private bool _begun;
         private bool _disposed;
+        private bool _immediateContextRecording;
         private ID3D11CommandList _commandList;
 
         private Viewport[] _viewports = new Viewport[0];
@@ -90,12 +92,15 @@ namespace Veldrid.D3D11
             : base(ref description, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
         {
             _gd = gd;
-            _context = gd.Device.CreateDeferredContext();
+            _usesImmediateContext = gd.UseImmediateContext;
+            _context = _usesImmediateContext ? gd.ImmediateContext : gd.Device.CreateDeferredContext();
             _context1 = _context.QueryInterfaceOrNull<ID3D11DeviceContext1>();
             _uda = _context.QueryInterfaceOrNull<ID3DUserDefinedAnnotation>();
         }
 
         public ID3D11CommandList DeviceCommandList => _commandList;
+
+        internal bool UsesImmediateContext => _usesImmediateContext;
 
         internal ID3D11DeviceContext DeviceContext => _context;
 
@@ -107,8 +112,22 @@ namespace Veldrid.D3D11
         {
             _commandList?.Dispose();
             _commandList = null;
-            ClearState();
-            _begun = true;
+            if (_usesImmediateContext)
+            {
+                _gd.BeginImmediateContextRecording();
+                _immediateContextRecording = true;
+            }
+
+            try
+            {
+                ClearState();
+                _begun = true;
+            }
+            catch
+            {
+                EndImmediateContextRecording();
+                throw;
+            }
         }
 
         private void ClearState()
@@ -191,15 +210,29 @@ namespace Veldrid.D3D11
                 throw new VeldridException("Invalid use of End().");
             }
 
-            _context.FinishCommandList(false, out _commandList).CheckError();
-            _commandList.DebugName = _name;
-            ResetManagedState();
-            _begun = false;
+            try
+            {
+                if (!_usesImmediateContext)
+                {
+                    _context.FinishCommandList(false, out _commandList).CheckError();
+                    _commandList.DebugName = _name;
+                }
+                ResetManagedState();
+                _begun = false;
+            }
+            finally
+            {
+                EndImmediateContextRecording();
+            }
         }
 
         public void Reset()
         {
-            if (_commandList != null)
+            if (_usesImmediateContext)
+            {
+                if (_begun) _context.ClearState();
+            }
+            else if (_commandList != null)
             {
                 _commandList.Dispose();
                 _commandList = null;
@@ -214,6 +247,7 @@ namespace Veldrid.D3D11
 
             ResetManagedState();
             _begun = false;
+            EndImmediateContextRecording();
         }
 
         private protected override void SetIndexBufferCore(DeviceBuffer buffer, IndexFormat format, uint offset)
@@ -1328,7 +1362,7 @@ namespace Veldrid.D3D11
 
         internal void OnCompleted()
         {
-            _commandList.Dispose();
+            _commandList?.Dispose();
             _commandList = null;
 
             foreach (D3D11Swapchain sc in _referencedSwapchains)
@@ -1343,6 +1377,13 @@ namespace Veldrid.D3D11
             }
 
             _submittedStagingBuffers.Clear();
+        }
+
+        void EndImmediateContextRecording()
+        {
+            if (!_immediateContextRecording) return;
+            _immediateContextRecording = false;
+            _gd.EndImmediateContextRecording();
         }
 
         private protected override void PushDebugGroupCore(string name)
@@ -1364,10 +1405,11 @@ namespace Veldrid.D3D11
         {
             if (!_disposed)
             {
+                Reset();
                 _uda?.Dispose();
                 DeviceCommandList?.Dispose();
                 _context1?.Dispose();
-                _context.Dispose();
+                if (!_usesImmediateContext) _context.Dispose();
 
                 foreach (BoundResourceSetInfo boundGraphicsSet in _graphicsResourceSets)
                 {

@@ -27,6 +27,7 @@ namespace Veldrid.D3D11
         private readonly D3D11Swapchain _mainSwapchain;
         private readonly bool _supportsConcurrentResources;
         private readonly bool _supportsCommandLists;
+        private readonly bool _useImmediateContext;
         private readonly object _immediateContextLock = new object();
         private readonly BackendInfoD3D11 _d3d11Info;
 
@@ -62,6 +63,10 @@ namespace Veldrid.D3D11
         public bool SupportsConcurrentResources => _supportsConcurrentResources;
 
         public bool SupportsCommandLists => _supportsCommandLists;
+
+        internal bool UseImmediateContext => _useImmediateContext;
+
+        internal ID3D11DeviceContext ImmediateContext => _immediateContext;
 
         public int DeviceId => _deviceId;
 
@@ -172,6 +177,7 @@ namespace Veldrid.D3D11
             }
             _immediateContext = _device.ImmediateContext;
             _device.CheckThreadingSupport(out _supportsConcurrentResources, out _supportsCommandLists);
+            _useImmediateContext = options.UseImmediateContext;
 
             IsDebugEnabled = (flags & DeviceCreationFlags.Debug) != 0;
 
@@ -215,12 +221,19 @@ namespace Veldrid.D3D11
         private protected override void SubmitCommandsCore(CommandList cl, Fence fence)
         {
             D3D11CommandList d3d11CL = Util.AssertSubtype<CommandList, D3D11CommandList>(cl);
-            lock (_immediateContextLock)
+            if (d3d11CL.UsesImmediateContext)
             {
-                if (d3d11CL.DeviceCommandList != null) // CommandList may have been reset in the meantime (resized swapchain).
+                d3d11CL.OnCompleted();
+            }
+            else
+            {
+                lock (_immediateContextLock)
                 {
-                    _immediateContext.ExecuteCommandList(d3d11CL.DeviceCommandList, false);
-                    d3d11CL.OnCompleted();
+                    if (d3d11CL.DeviceCommandList != null) // CommandList may have been reset in the meantime (resized swapchain).
+                    {
+                        _immediateContext.ExecuteCommandList(d3d11CL.DeviceCommandList, false);
+                        d3d11CL.OnCompleted();
+                    }
                 }
             }
 
@@ -229,6 +242,10 @@ namespace Veldrid.D3D11
                 d3d11Fence.Set();
             }
         }
+
+        internal void BeginImmediateContextRecording() => Monitor.Enter(_immediateContextLock);
+
+        internal void EndImmediateContextRecording() => Monitor.Exit(_immediateContextLock);
 
         private protected override void SwapBuffersCore(Swapchain swapchain)
         {

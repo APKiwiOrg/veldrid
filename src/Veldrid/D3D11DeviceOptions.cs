@@ -17,5 +17,12 @@ namespace Veldrid
         /// See <see cref="Vortice.Direct3D11.DeviceCreationFlags"/> for details.
         /// </summary>
         public uint DeviceCreationFlags;
+
+        /// <summary>
+        /// When true, command lists record directly into the Direct3D11 immediate context instead of a deferred
+        /// context. Recording is serialized for the lifetime of each command list, so callers must not assume that
+        /// separate command lists can record concurrently.
+        /// </summary>
+        public bool UseImmediateContext;
     }
 }
