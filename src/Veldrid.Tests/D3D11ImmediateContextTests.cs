@@ -18,6 +18,81 @@ namespace Veldrid.Tests
     [Trait("Backend", "D3D11ImmediateContext")]
     public class D3D11ImmediateContextTextureTests : TextureTestBase<D3D11ImmediateContextDeviceCreator> { }
 
+    [Trait("Backend", "D3D11")]
+    public class D3D11PipelineSwitchTests : D3D11PipelineSwitchTestBase<D3D11DeviceCreator> { }
+
+    [Trait("Backend", "D3D11ImmediateContext")]
+    public class D3D11ImmediateContextPipelineSwitchTests : D3D11PipelineSwitchTestBase<D3D11ImmediateContextDeviceCreator> { }
+
+    // D3D11 specific on purpose, and not a portability claim. The D3D11 backend leaves the device holding a
+    // resource set across a pipeline switch, so a set bound under one pipeline is still in effect under the
+    // next one when the two share their layouts. Other backends do not promise that, and Vulkan faults on
+    // this sequence, so the test is not lifted into the shared per-backend suites. It is here because the
+    // backend batches its resource set fan-out to the next draw or dispatch, which puts a pipeline switch
+    // between a bind and its flush, and that is the one place the batching could drop a binding outright.
+    public abstract class D3D11PipelineSwitchTestBase<T> : GraphicsDeviceTestBase<T> where T : GraphicsDeviceCreator
+    {
+        private const uint ValueCount = 64;
+        private const uint Sentinel = 0xDEADBEEF;
+
+        [Fact]
+        public void ComputeResourceSetBoundBeforeAPipelineSwitchSurvivesIt()
+        {
+            uint sizeInBytes = ValueCount * sizeof(uint);
+
+            DeviceBuffer copySrc = RF.CreateBuffer(
+                new BufferDescription(sizeInBytes, BufferUsage.StructuredBufferReadOnly, sizeof(uint), true));
+            DeviceBuffer copyDst = RF.CreateBuffer(
+                new BufferDescription(sizeInBytes, BufferUsage.StructuredBufferReadWrite, sizeof(uint), true));
+
+            ResourceLayout layout = RF.CreateResourceLayout(new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription("CopySrc", ResourceKind.StructuredBufferReadOnly, ShaderStages.Compute),
+                new ResourceLayoutElementDescription("CopyDst", ResourceKind.StructuredBufferReadWrite, ShaderStages.Compute)));
+
+            ResourceSet set = RF.CreateResourceSet(new ResourceSetDescription(layout, copySrc, copyDst));
+
+            // Two distinct pipelines over the same shader and the same layout, which is what a real renderer
+            // ends up with when two pipelines differ only in fixed-function state.
+            Pipeline first = RF.CreateComputePipeline(new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "FillBuffer"), layout, 1, 1, 1));
+            Pipeline second = RF.CreateComputePipeline(new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "FillBuffer"), layout, 1, 1, 1));
+
+            uint[] srcData = new uint[ValueCount];
+            uint[] dstData = new uint[ValueCount];
+            for (uint i = 0; i < ValueCount; i++)
+            {
+                srcData[i] = i + 1;
+                dstData[i] = Sentinel;
+            }
+            GD.UpdateBuffer(copySrc, 0, srcData);
+            GD.UpdateBuffer(copyDst, 0, dstData);
+
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+
+            // Bind under the first pipeline, dispatch under the second, with no rebind in between. The set
+            // has to reach the device before the switch drops its record, or the dispatch runs with nothing
+            // bound and leaves the sentinel in place.
+            cl.SetPipeline(first);
+            cl.SetComputeResourceSet(0, set);
+            cl.SetPipeline(second);
+            cl.Dispatch(ValueCount, 1, 1);
+
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            DeviceBuffer readback = GetReadback(copyDst);
+            MappedResourceView<uint> readView = GD.Map<uint>(readback, MapMode.Read);
+            for (uint i = 0; i < ValueCount; i++)
+            {
+                Assert.Equal(srcData[i], readView[i]);
+            }
+            GD.Unmap(readback);
+        }
+    }
+
     [Trait("Backend", "D3D11ImmediateContext")]
     public class D3D11ImmediateContextRecordingTests : GraphicsDeviceTestBase<D3D11ImmediateContextDeviceCreator>
     {
