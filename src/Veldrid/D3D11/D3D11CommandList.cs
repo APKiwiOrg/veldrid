@@ -530,6 +530,27 @@ namespace Veldrid.D3D11
                 // another set owns, which marks that set dirty again, and a set that is its own victim has to
                 // keep that mark for the next draw rather than have it wiped by this one.
                 dirty[i] = ResourceSetDirtyState.Clean;
+
+                if (sets[i].Set == null)
+                {
+                    // A mark can name a slot whose record is already gone. The bound-texture records carry
+                    // the slot that bound them and outlive ClearSets, because only an unbind or
+                    // ResetManagedState empties them, so UnbindSRVTexture and UnbindUAVTexture can mark a
+                    // slot that a pipeline switch has since cleared. SetFramebufferCore reaches that by
+                    // unbinding a colour target an earlier pipeline's set sampled, and an unbind raised
+                    // during this very loop reaches it too. There is nothing left to activate, and the
+                    // unbind has already nulled the device slot, so dropping the mark is the whole job.
+                    // Without this, Util.AssertSubtype in the activation below throws on the null in Debug
+                    // and the layout dereference behind it faults in Release.
+                    //
+                    // Only Full can arrive here. DynamicOffsetsOnly is written in one place, where the
+                    // incoming set was compared equal to the recorded one and then written into it, so it
+                    // always names a live record. The guard sits ahead of both branches anyway, because the
+                    // invariant it states is "no record, nothing to flush" rather than a fact about one of
+                    // them.
+                    continue;
+                }
+
                 if (state == ResourceSetDirtyState.DynamicOffsetsOnly)
                 {
                     ActivateResourceSetDynamicOffsets(i, sets[i], graphics);
