@@ -489,6 +489,17 @@ namespace Veldrid.D3D11
             // there. That does not hold while a full fan-out is still pending for the slot: that set has never
             // reached the device at all, and the cheap path would bind its buffers and leave its textures,
             // samplers and fixed-range views unbound.
+            //
+            // The dirty state is the whole guard, and it sees two of the three unbinds. UnbindSRVTexture and
+            // UnbindUAVTexture both raise the slot to Full, so a set either of them disturbed cannot take this
+            // path. UnbindUAVBuffer does not, and cannot as things stand, because its record is a (buffer,
+            // slot) pair that never carried the set that bound it. So a FIXED-RANGE read-write structured
+            // buffer nulled by SetIndexBufferCore, SetVertexBufferCore or an aliasing BindStorageBufferView
+            // stays null through an offsets-only rebind of its set, where the old unconditional re-activation
+            // would have rebound it. That is left as is deliberately. UnbindUAVBuffer exists to make the
+            // index, vertex or read-only binding win a conflict D3D11 cannot honour both sides of, and the
+            // old re-activation quietly undid that resolution on the next rebind. Neither reading is
+            // reachable without binding one buffer two incompatible ways at once.
             bool offsetsOnly = sets[slot].Set == set
                 && sets[slot].Offsets.Count == dynamicOffsetsCount
                 && dirty[slot] != ResourceSetDirtyState.Full;
