@@ -18,7 +18,17 @@ namespace Veldrid
         {
             if (count > MaxFixedValues)
             {
-                Data = ArrayPool<uint>.Shared.Rent((int)count);
+                // A rented array carries whatever the previous renter left in it, so the values have to be
+                // copied in the same way the fixed buffer copies them. Reading Get(i) off an uncopied rent
+                // returned pool garbage, and BoundResourceSetInfo.Equals compared that garbage.
+                uint[] rented = ArrayPool<uint>.Shared.Rent((int)count);
+
+                for (int i = 0; i < count; i++)
+                {
+                    rented[i] = Unsafe.Add(ref data, i);
+                }
+
+                Data = rented;
             }
             else
             {
