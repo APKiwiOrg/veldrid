@@ -261,3 +261,6 @@ launchSettings.json
 
 # Generated shaders
 Shaders.Generated
+
+# Agent build scratch home
+.buildhome/
