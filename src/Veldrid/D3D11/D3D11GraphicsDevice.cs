@@ -29,16 +29,23 @@ namespace Veldrid.D3D11
         private readonly bool _supportsCommandLists;
         private readonly bool _useImmediateContext;
 
-        // Guards every use of the immediate context. Normally held only for the duration of one call. When
-        // D3D11DeviceOptions.UseImmediateContext is set, a D3D11CommandList holds it from Begin all the way to
-        // SubmitCommands instead, which is usually a whole frame, so everything below that locks it (Map,
-        // Unmap, UpdateBuffer, UpdateTexture, SwapBuffers) blocks other threads for that span. It is a Monitor
-        // and therefore reentrant, so the recording thread's own calls pass straight through and land at that
-        // point in the command stream rather than ahead of the frame the way deferred mode puts them. See the
-        // remarks on D3D11DeviceOptions.UseImmediateContext.
+        // LOCK ORDER: _immediateContextLock is the OUTERMOST lock in this backend. Any other lock here
+        // (_mappedResourceLock, _stagingResourcesLock, D3D11Buffer._accessViewLock) may only be taken while
+        // already holding it or while holding nothing, never the other way round. This is not stylistic. When
+        // D3D11DeviceOptions.UseImmediateContext is set, a D3D11CommandList holds this lock from Begin all the
+        // way to SubmitCommands, and the recording thread can re-enter the device through any Map, Unmap or
+        // UpdateBuffer it makes during that frame. A second thread that grabbed an inner lock first and then
+        // waited on this one would deadlock against it. MapCore and UnmapCore used to do exactly that.
+        //
+        // Consequences of the frame-long hold: everything that locks it (Map, Unmap, UpdateBuffer,
+        // UpdateTexture, SwapBuffers) blocks other threads for the whole frame. It is a Monitor and therefore
+        // reentrant, so the recording thread's own calls pass straight through and land at that point in the
+        // command stream rather than ahead of the frame the way deferred mode puts them. See the remarks on
+        // D3D11DeviceOptions.UseImmediateContext.
         private readonly object _immediateContextLock = new object();
         private readonly BackendInfoD3D11 _d3d11Info;
 
+        // Guards _mappedResources only. Inner to _immediateContextLock, see the lock-order note above.
         private readonly object _mappedResourceLock = new object();
         private readonly Dictionary<MappedResourceCacheKey, MappedResourceInfo> _mappedResources
             = new Dictionary<MappedResourceCacheKey, MappedResourceInfo>();
@@ -345,25 +352,30 @@ namespace Veldrid.D3D11
         protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
         {
             MappedResourceCacheKey key = new MappedResourceCacheKey(resource, subresource);
-            lock (_mappedResourceLock)
+
+            // _immediateContextLock first, and unconditionally, even on the refcount-only path that never
+            // touches the context. Taking _mappedResourceLock first would invert the order against a thread
+            // recording into the immediate context, which holds _immediateContextLock for a whole frame and
+            // reaches this method through any device-level Map, Unmap or UpdateBuffer it makes meanwhile.
+            lock (_immediateContextLock)
             {
-                if (_mappedResources.TryGetValue(key, out MappedResourceInfo info))
+                lock (_mappedResourceLock)
                 {
-                    if (info.Mode != mode)
+                    if (_mappedResources.TryGetValue(key, out MappedResourceInfo info))
                     {
-                        throw new VeldridException("The given resource was already mapped with a different MapMode.");
+                        if (info.Mode != mode)
+                        {
+                            throw new VeldridException("The given resource was already mapped with a different MapMode.");
+                        }
+
+                        info.RefCount += 1;
+                        _mappedResources[key] = info;
                     }
-
-                    info.RefCount += 1;
-                    _mappedResources[key] = info;
-                }
-                else
-                {
-                    // No current mapping exists -- create one.
-
-                    if (resource is D3D11Buffer buffer)
+                    else
                     {
-                        lock (_immediateContextLock)
+                        // No current mapping exists -- create one.
+
+                        if (resource is D3D11Buffer buffer)
                         {
                             MappedSubresource msr = _immediateContext.Map(
                                 buffer.Buffer,
@@ -376,12 +388,9 @@ namespace Veldrid.D3D11
                             info.Mode = mode;
                             _mappedResources.Add(key, info);
                         }
-                    }
-                    else
-                    {
-                        D3D11Texture texture = Util.AssertSubtype<MappableResource, D3D11Texture>(resource);
-                        lock (_immediateContextLock)
+                        else
                         {
+                            D3D11Texture texture = Util.AssertSubtype<MappableResource, D3D11Texture>(resource);
                             Util.GetMipLevelAndArrayLayer(texture, subresource, out uint mipLevel, out uint arrayLayer);
                             _immediateContext.Map(
                                 texture.DeviceTexture,
@@ -405,9 +414,9 @@ namespace Veldrid.D3D11
                             _mappedResources.Add(key, info);
                         }
                     }
-                }
 
-                return info.MappedResource;
+                    return info.MappedResource;
+                }
             }
         }
 
@@ -416,18 +425,19 @@ namespace Veldrid.D3D11
             MappedResourceCacheKey key = new MappedResourceCacheKey(resource, subresource);
             bool commitUnmap;
 
-            lock (_mappedResourceLock)
+            // _immediateContextLock first. See the note in MapCore.
+            lock (_immediateContextLock)
             {
-                if (!_mappedResources.TryGetValue(key, out MappedResourceInfo info))
+                lock (_mappedResourceLock)
                 {
-                    throw new VeldridException($"The given resource ({resource}) is not mapped.");
-                }
+                    if (!_mappedResources.TryGetValue(key, out MappedResourceInfo info))
+                    {
+                        throw new VeldridException($"The given resource ({resource}) is not mapped.");
+                    }
 
-                info.RefCount -= 1;
-                commitUnmap = info.RefCount == 0;
-                if (commitUnmap)
-                {
-                    lock (_immediateContextLock)
+                    info.RefCount -= 1;
+                    commitUnmap = info.RefCount == 0;
+                    if (commitUnmap)
                     {
                         if (resource is D3D11Buffer buffer)
                         {
@@ -442,10 +452,10 @@ namespace Veldrid.D3D11
                         bool result = _mappedResources.Remove(key);
                         Debug.Assert(result);
                     }
-                }
-                else
-                {
-                    _mappedResources[key] = info;
+                    else
+                    {
+                        _mappedResources[key] = info;
+                    }
                 }
             }
         }

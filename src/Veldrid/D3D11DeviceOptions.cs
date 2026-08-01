@@ -36,8 +36,10 @@ namespace Veldrid
         /// <see cref="GraphicsDevice.Map(MappableResource, MapMode)"/> and
         /// <see cref="GraphicsDevice.Unmap(MappableResource)"/> called from other threads, and
         /// <see cref="GraphicsDevice.SwapBuffers()"/>, which takes the same lock and holds it through a Present
-        /// that blocks on vertical blank. Nothing becomes unsafe. Latency does: a worker thread streaming
-        /// uploads stalls until the frame in flight is submitted, and again for the length of each Present.
+        /// that blocks on vertical blank. Those other threads block, they do not deadlock: the recording lock
+        /// is the outermost lock in the backend, so a worker cannot be holding something the recording thread
+        /// goes on to want. What you lose is latency. A worker streaming uploads stalls until the frame in
+        /// flight is submitted, and again for the length of each Present.
         /// </para>
         /// <para>
         /// Ordering. The lock is reentrant, so the recording thread is never blocked by its own frame. A
