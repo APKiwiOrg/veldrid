@@ -57,13 +57,16 @@ namespace Veldrid.D3D11
 
         private new D3D11Pipeline _graphicsPipeline;
         private BoundResourceSetInfo[] _graphicsResourceSets = new BoundResourceSetInfo[1];
-        // Resource sets are invalidated when a new resource set is bound with an incompatible SRV or UAV.
-        private bool[] _invalidatedGraphicsResourceSets = new bool[1];
+        // A slot is dirty while the device has still to be told about the set recorded in it: either because
+        // the set was just bound, or because it was invalidated when another set bound an incompatible SRV or
+        // UAV. Dirty slots are flushed at the next draw, so a slot rebound several times between two draws
+        // costs one fan-out rather than one per rebind, and a set bound and then replaced costs none.
+        private bool[] _dirtyGraphicsResourceSets = new bool[1];
 
         private new D3D11Pipeline _computePipeline;
         private BoundResourceSetInfo[] _computeResourceSets = new BoundResourceSetInfo[1];
-        // Resource sets are invalidated when a new resource set is bound with an incompatible SRV or UAV.
-        private bool[] _invalidatedComputeResourceSets = new bool[1];
+        // As above, flushed at the next dispatch instead of the next draw.
+        private bool[] _dirtyComputeResourceSets = new bool[1];
         private string _name;
         private bool _vertexBindingsChanged;
         private ID3D11Buffer[] _cbOut = new ID3D11Buffer[1];
@@ -192,6 +195,9 @@ namespace Veldrid.D3D11
             _pixelShader = null;
 
             ClearSets(_graphicsResourceSets);
+            // The dirty flags have to go with the sets they point at. A flag surviving its set would send a
+            // null ResourceSet through the next flush.
+            Util.ClearArray(_dirtyGraphicsResourceSets);
 
             Util.ClearArray(_vertexBoundUniformBuffers);
             Util.ClearArray(_vertexBoundTextureViews);
@@ -203,6 +209,7 @@ namespace Veldrid.D3D11
 
             _computePipeline = null;
             ClearSets(_computeResourceSets);
+            Util.ClearArray(_dirtyComputeResourceSets);
 
             foreach (KeyValuePair<Texture, List<BoundTextureInfo>> kvp in _boundSRVs)
             {
@@ -317,7 +324,7 @@ namespace Veldrid.D3D11
                 D3D11Pipeline d3dPipeline = Util.AssertSubtype<Pipeline, D3D11Pipeline>(pipeline);
                 _graphicsPipeline = d3dPipeline;
                 ClearSets(_graphicsResourceSets); // Invalidate resource set bindings -- they may be invalid.
-                Util.ClearArray(_invalidatedGraphicsResourceSets);
+                Util.ClearArray(_dirtyGraphicsResourceSets);
 
                 ID3D11BlendState blendState = d3dPipeline.BlendState;
                 Color4 blendFactor = d3dPipeline.BlendFactor;
@@ -402,44 +409,74 @@ namespace Veldrid.D3D11
                 }
 
                 Util.EnsureArrayMinimumSize(ref _graphicsResourceSets, (uint)d3dPipeline.ResourceLayouts.Length);
-                Util.EnsureArrayMinimumSize(ref _invalidatedGraphicsResourceSets, (uint)d3dPipeline.ResourceLayouts.Length);
+                Util.EnsureArrayMinimumSize(ref _dirtyGraphicsResourceSets, (uint)d3dPipeline.ResourceLayouts.Length);
             }
             else if (pipeline.IsComputePipeline && _computePipeline != pipeline)
             {
                 D3D11Pipeline d3dPipeline = Util.AssertSubtype<Pipeline, D3D11Pipeline>(pipeline);
                 _computePipeline = d3dPipeline;
                 ClearSets(_computeResourceSets); // Invalidate resource set bindings -- they may be invalid.
-                Util.ClearArray(_invalidatedComputeResourceSets);
+                Util.ClearArray(_dirtyComputeResourceSets);
 
                 ID3D11ComputeShader computeShader = d3dPipeline.ComputeShader;
                 _context.CSSetShader(computeShader);
                 Util.EnsureArrayMinimumSize(ref _computeResourceSets, (uint)d3dPipeline.ResourceLayouts.Length);
-                Util.EnsureArrayMinimumSize(ref _invalidatedComputeResourceSets, (uint)d3dPipeline.ResourceLayouts.Length);
+                Util.EnsureArrayMinimumSize(ref _dirtyComputeResourceSets, (uint)d3dPipeline.ResourceLayouts.Length);
             }
         }
 
         protected override void SetGraphicsResourceSetCore(uint slot, ResourceSet rs, uint dynamicOffsetsCount, ref uint dynamicOffsets)
         {
-            if (_graphicsResourceSets[slot].Equals(rs, dynamicOffsetsCount, ref dynamicOffsets))
-            {
-                return;
-            }
-
-            _graphicsResourceSets[slot].Offsets.Dispose();
-            _graphicsResourceSets[slot] = new BoundResourceSetInfo(rs, dynamicOffsetsCount, ref dynamicOffsets);
-            ActivateResourceSet(slot, _graphicsResourceSets[slot], true);
+            RecordResourceSet(_graphicsResourceSets, _dirtyGraphicsResourceSets, slot, rs, dynamicOffsetsCount, ref dynamicOffsets);
         }
 
         protected override void SetComputeResourceSetCore(uint slot, ResourceSet set, uint dynamicOffsetsCount, ref uint dynamicOffsets)
         {
-            if (_computeResourceSets[slot].Equals(set, dynamicOffsetsCount, ref dynamicOffsets))
+            RecordResourceSet(_computeResourceSets, _dirtyComputeResourceSets, slot, set, dynamicOffsetsCount, ref dynamicOffsets);
+        }
+
+        // Records a set without touching the device. The fan-out costs one native call per resource per shader
+        // stage, so it waits for the draw or dispatch that actually needs it, the way the Vulkan backend defers
+        // vkCmdBindDescriptorSets to PreDrawCommand.
+        private static void RecordResourceSet(
+            BoundResourceSetInfo[] sets,
+            bool[] dirty,
+            uint slot,
+            ResourceSet set,
+            uint dynamicOffsetsCount,
+            ref uint dynamicOffsets)
+        {
+            if (sets[slot].Equals(set, dynamicOffsetsCount, ref dynamicOffsets))
             {
+                // Nothing changed, so there is nothing new to record. Note this leaves the dirty flag alone:
+                // an earlier bind of this same slot may still be waiting for its flush, and clearing the flag
+                // here would drop that binding on the floor.
                 return;
             }
 
-            _computeResourceSets[slot].Offsets.Dispose();
-            _computeResourceSets[slot] = new BoundResourceSetInfo(set, dynamicOffsetsCount, ref dynamicOffsets);
-            ActivateResourceSet(slot, _computeResourceSets[slot], false);
+            sets[slot].Offsets.Dispose();
+            sets[slot] = new BoundResourceSetInfo(set, dynamicOffsetsCount, ref dynamicOffsets);
+            dirty[slot] = true;
+        }
+
+        // Pushes every set the device has still to hear about. Called from the draw and dispatch paths, so it
+        // always runs on the recording thread inside the Begin..End window, under whatever immediate-context
+        // lock that thread already holds.
+        private void FlushResourceSets(BoundResourceSetInfo[] sets, bool[] dirty, int resourceSetCount, bool graphics)
+        {
+            for (uint i = 0; i < resourceSetCount; i++)
+            {
+                if (!dirty[i])
+                {
+                    continue;
+                }
+
+                // Clear before activating, never after. Activating a set can unbind an SRV or a UAV that
+                // another set owns, which marks that set dirty again, and a set that is its own victim has to
+                // keep that mark for the next draw rather than have it wiped by this one.
+                dirty[i] = false;
+                ActivateResourceSet(i, sets[i], graphics);
+            }
         }
 
         private void ActivateResourceSet(uint slot, BoundResourceSetInfo brsi, bool graphics)
@@ -533,13 +570,15 @@ namespace Veldrid.D3D11
                 {
                     BindTextureView(null, bti.Slot, bti.Stages, 0);
 
+                    // Mark the set dirty rather than re-running its fan-out here. The next draw or dispatch
+                    // flushes it, which also collapses a run of unbinds that hit the same set into one.
                     if ((bti.Stages & ShaderStages.Compute) == ShaderStages.Compute)
                     {
-                        _invalidatedComputeResourceSets[bti.ResourceSet] = true;
+                        _dirtyComputeResourceSets[bti.ResourceSet] = true;
                     }
                     else
                     {
-                        _invalidatedGraphicsResourceSets[bti.ResourceSet] = true;
+                        _dirtyGraphicsResourceSets[bti.ResourceSet] = true;
                     }
                 }
 
@@ -565,11 +604,11 @@ namespace Veldrid.D3D11
                     BindUnorderedAccessView(null, null, null, bti.Slot, bti.Stages, bti.ResourceSet);
                     if ((bti.Stages & ShaderStages.Compute) == ShaderStages.Compute)
                     {
-                        _invalidatedComputeResourceSets[bti.ResourceSet] = true;
+                        _dirtyComputeResourceSets[bti.ResourceSet] = true;
                     }
                     else
                     {
-                        _invalidatedGraphicsResourceSets[bti.ResourceSet] = true;
+                        _dirtyGraphicsResourceSets[bti.ResourceSet] = true;
                     }
                 }
 
@@ -707,15 +746,11 @@ namespace Veldrid.D3D11
             FlushScissorRects();
             FlushVertexBindings();
 
-            int graphicsResourceCount = _graphicsPipeline.ResourceLayouts.Length;
-            for (uint i = 0; i < graphicsResourceCount; i++)
-            {
-                if (_invalidatedGraphicsResourceSets[i])
-                {
-                    _invalidatedGraphicsResourceSets[i] = false;
-                    ActivateResourceSet(i, _graphicsResourceSets[i], true);
-                }
-            }
+            FlushResourceSets(
+                _graphicsResourceSets,
+                _dirtyGraphicsResourceSets,
+                _graphicsPipeline.ResourceLayouts.Length,
+                true);
         }
 
         public override void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ)
@@ -734,15 +769,11 @@ namespace Veldrid.D3D11
 
         private void PreDispatchCommand()
         {
-            int computeResourceCount = _computePipeline.ResourceLayouts.Length;
-            for (uint i = 0; i < computeResourceCount; i++)
-            {
-                if (_invalidatedComputeResourceSets[i])
-                {
-                    _invalidatedComputeResourceSets[i] = false;
-                    ActivateResourceSet(i, _computeResourceSets[i], false);
-                }
-            }
+            FlushResourceSets(
+                _computeResourceSets,
+                _dirtyComputeResourceSets,
+                _computePipeline.ResourceLayouts.Length,
+                false);
         }
 
         protected override void ResolveTextureCore(Texture source, Texture destination)
