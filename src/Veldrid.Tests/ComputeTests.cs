@@ -513,6 +513,146 @@ void main()
             GD.Unmap(readback);
         }
 
+        [SkippableFact]
+        public void FillBuffer_ChangingOnlyOffsetsBetweenDispatches()
+        {
+            Skip.IfNot(GD.Features.ComputeShader);
+            Skip.IfNot(GD.Features.BufferRangeBinding);
+
+            FillBufferRegions regions = new FillBufferRegions(GD, RF);
+
+            uint[] srcData = Enumerable
+                .Range(0, (int)(regions.BufferSize / sizeof(uint)))
+                .Select(i => (uint)i)
+                .ToArray();
+            GD.UpdateBuffer(regions.CopySrc, 0, srcData);
+
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+            cl.SetPipeline(regions.Pipeline);
+
+            // Region 0 of the source into region 1 of the destination.
+            uint[] offsets = new uint[] { 0, regions.RegionStride };
+            cl.SetComputeResourceSet(0, regions.Set, offsets);
+            cl.Dispatch(FillBufferRegions.ValueCount, 1, 1);
+
+            // Then the other way around. The ResourceSet is the same object with the same bindings, so only
+            // the offsets differ, and both of them move at once. A backend that rebinds a stale offset for
+            // either the source or the destination writes the wrong region or reads the wrong one.
+            offsets = new uint[] { regions.RegionStride, 0 };
+            cl.SetComputeResourceSet(0, regions.Set, offsets);
+            cl.Dispatch(FillBufferRegions.ValueCount, 1, 1);
+
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            uint stride = regions.RegionStride / sizeof(uint);
+            DeviceBuffer readback = GetReadback(regions.CopyDst);
+            MappedResourceView<uint> readView = GD.Map<uint>(readback, MapMode.Read);
+            for (uint i = 0; i < FillBufferRegions.ValueCount; i++)
+            {
+                Assert.Equal(srcData[i], readView[stride + i]);
+                Assert.Equal(srcData[stride + i], readView[i]);
+            }
+            GD.Unmap(readback);
+        }
+
+        [SkippableFact]
+        public void FillBuffer_ResourceSetReboundBeforeDispatch()
+        {
+            Skip.IfNot(GD.Features.ComputeShader);
+            Skip.IfNot(GD.Features.BufferRangeBinding);
+
+            FillBufferRegions regions = new FillBufferRegions(GD, RF);
+
+            uint valueTotal = regions.BufferSize / sizeof(uint);
+            uint[] srcData = Enumerable.Range(0, (int)valueTotal).Select(i => (uint)i).ToArray();
+            GD.UpdateBuffer(regions.CopySrc, 0, srcData);
+
+            // A sentinel the shader never writes, so an unwanted copy into region 1 is visible.
+            uint[] dstData = Enumerable.Repeat(0xDEADBEEFu, (int)valueTotal).ToArray();
+            GD.UpdateBuffer(regions.CopyDst, 0, dstData);
+
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+            cl.SetPipeline(regions.Pipeline);
+
+            // Three binds, one dispatch. The dispatch has to see the last of them and nothing else: the first
+            // is superseded before anything reads it, and the repeated identical bind must not cancel the
+            // binding that is still pending.
+            uint[] offsets = new uint[] { regions.RegionStride, regions.RegionStride };
+            cl.SetComputeResourceSet(0, regions.Set, offsets);
+            offsets = new uint[] { 0, 0 };
+            cl.SetComputeResourceSet(0, regions.Set, offsets);
+            cl.SetComputeResourceSet(0, regions.Set, offsets);
+            cl.Dispatch(FillBufferRegions.ValueCount, 1, 1);
+
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+
+            uint stride = regions.RegionStride / sizeof(uint);
+            DeviceBuffer readback = GetReadback(regions.CopyDst);
+            MappedResourceView<uint> readView = GD.Map<uint>(readback, MapMode.Read);
+            for (uint i = 0; i < FillBufferRegions.ValueCount; i++)
+            {
+                Assert.Equal(srcData[i], readView[i]);
+                Assert.Equal(0xDEADBEEFu, readView[stride + i]);
+            }
+            GD.Unmap(readback);
+        }
+
+        // Two equally sized, non-overlapping regions in one source and one destination buffer, wired to the
+        // FillBuffer compute shader through a single set whose two bindings are both dynamic. Which region a
+        // dispatch reads and which it writes is then purely a matter of the dynamic offsets.
+        private sealed class FillBufferRegions
+        {
+            public const uint ValueCount = 64;
+
+            public readonly uint RegionStride;
+            public readonly uint BufferSize;
+            public readonly DeviceBuffer CopySrc;
+            public readonly DeviceBuffer CopyDst;
+            public readonly ResourceSet Set;
+            public readonly Pipeline Pipeline;
+
+            public FillBufferRegions(GraphicsDevice gd, ResourceFactory rf)
+            {
+                uint dataSize = ValueCount * sizeof(uint);
+                uint alignment = gd.StructuredBufferMinOffsetAlignment;
+                RegionStride = ((dataSize + alignment - 1) / alignment) * alignment;
+                BufferSize = RegionStride + dataSize;
+
+                CopySrc = rf.CreateBuffer(
+                    new BufferDescription(BufferSize, BufferUsage.StructuredBufferReadOnly, sizeof(uint), true));
+                CopyDst = rf.CreateBuffer(
+                    new BufferDescription(BufferSize, BufferUsage.StructuredBufferReadWrite, sizeof(uint), true));
+
+                ResourceLayout layout = rf.CreateResourceLayout(new ResourceLayoutDescription(
+                    new ResourceLayoutElementDescription(
+                        "CopySrc",
+                        ResourceKind.StructuredBufferReadOnly,
+                        ShaderStages.Compute,
+                        ResourceLayoutElementOptions.DynamicBinding),
+                    new ResourceLayoutElementDescription(
+                        "CopyDst",
+                        ResourceKind.StructuredBufferReadWrite,
+                        ShaderStages.Compute,
+                        ResourceLayoutElementOptions.DynamicBinding)));
+
+                Set = rf.CreateResourceSet(new ResourceSetDescription(
+                    layout,
+                    new DeviceBufferRange(CopySrc, 0, dataSize),
+                    new DeviceBufferRange(CopyDst, 0, dataSize)));
+
+                Pipeline = rf.CreateComputePipeline(new ComputePipelineDescription(
+                    TestShaders.LoadCompute(rf, "FillBuffer"),
+                    layout,
+                    1, 1, 1));
+            }
+        }
+
         public static IEnumerable<object[]> FillBuffer_WithOffsetsData()
         {
             foreach (uint srcSetMultiple in new[] { 0, 2, 10 })
