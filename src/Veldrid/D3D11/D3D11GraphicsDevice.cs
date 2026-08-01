@@ -43,6 +43,21 @@ namespace Veldrid.D3D11
         // command stream rather than ahead of the frame the way deferred mode puts them. See the remarks on
         // D3D11DeviceOptions.UseImmediateContext.
         private readonly object _immediateContextLock = new object();
+
+        // The D3D11CommandList that currently holds the immediate-context recording, or null when none does.
+        // In immediate mode every command list records into the one shared _immediateContext, so a second one
+        // reaching Begin would ClearState the live context out from under the first and leave it drawing with
+        // nothing bound. D3D11CommandList._recordingThreadId cannot catch that: it is per instance, and a
+        // fresh instance reads as "not recording" no matter what any other instance is doing. The owner has to
+        // live here, because this is the one object both instances can see.
+        //
+        // Published with Interlocked rather than under a lock, so it is not a lock and does not participate in
+        // the order above. Claimed before _immediateContextLock is entered and released before it is exited,
+        // which is what makes it safe to read without holding anything: the span this field names as owned
+        // always starts before the lock is taken for recording, so a second command list can never find it
+        // free and then block on a lock a recorder already holds. Blocking there would wedge that thread for
+        // the rest of the frame in silence, which is exactly the failure the throw replaces.
+        private D3D11CommandList _immediateRecorder;
         private readonly BackendInfoD3D11 _d3d11Info;
 
         // Guards _mappedResources only. Inner to _immediateContextLock, see the lock-order note above.
@@ -258,9 +273,67 @@ namespace Veldrid.D3D11
             }
         }
 
-        internal void BeginImmediateContextRecording() => Monitor.Enter(_immediateContextLock);
+        internal void BeginImmediateContextRecording(D3D11CommandList recorder)
+        {
+            // Claim the recording before entering the lock, never after. A command list that entered first and
+            // published second would leave a window where the context is being recorded into with no owner
+            // named, and a second command list arriving in that window would block on the lock until the first
+            // one submitted, a whole frame later, having been told nothing.
+            D3D11CommandList owner = Interlocked.CompareExchange(ref _immediateRecorder, recorder, null);
+            if (owner != null && owner != recorder)
+            {
+                throw new VeldridException(
+                    "A second CommandList cannot record while the immediate context is captured by an open "
+                    + "Begin(). A CommandList created with D3D11DeviceOptions.UseImmediateContext records "
+                    + "straight into the device's single immediate context, so beginning another one here "
+                    + "would clear the state the open CommandList has already bound. End() and "
+                    + "GraphicsDevice.SubmitCommands() the open CommandList first, or create the "
+                    + "GraphicsDevice without D3D11DeviceOptions.UseImmediateContext to record command lists "
+                    + "concurrently on deferred contexts.");
+            }
 
-        internal void EndImmediateContextRecording() => Monitor.Exit(_immediateContextLock);
+            // owner == recorder would mean this command list already claimed the recording and then lost track
+            // of it, which the release path below is written to make impossible. Enter anyway rather than
+            // throw: entering is what this method did before the owner existed, and the caller only reaches
+            // here when its own guard says it holds nothing.
+            Debug.Assert(owner == null, "The immediate-context recording was claimed twice by one CommandList.");
+
+            try
+            {
+                Monitor.Enter(_immediateContextLock);
+            }
+            catch
+            {
+                // Nothing was entered, so nothing may stay claimed.
+                Interlocked.CompareExchange(ref _immediateRecorder, null, recorder);
+                throw;
+            }
+        }
+
+        internal void EndImmediateContextRecording(D3D11CommandList recorder)
+        {
+            // Release the claim before leaving the lock, the mirror of the order in Begin above. Clearing
+            // after the exit would leave a window where the lock is free but this field still names a
+            // recording that has already finished, and a Begin landing in it would be refused for nothing.
+            D3D11CommandList owner = Interlocked.CompareExchange(ref _immediateRecorder, null, recorder);
+
+            try
+            {
+                Monitor.Exit(_immediateContextLock);
+            }
+            catch
+            {
+                // Monitor.Exit only throws when this thread does not hold the lock, and then the recording
+                // this field named is still somebody else's and still has to be releasable. Put back exactly
+                // what was taken away, so clearing first cannot strand a held lock with no owner named.
+                if (owner == recorder)
+                {
+                    Interlocked.CompareExchange(ref _immediateRecorder, recorder, null);
+                }
+
+                throw;
+            }
+        }
 
         private protected override void SwapBuffersCore(Swapchain swapchain)
         {

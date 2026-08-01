@@ -149,10 +149,17 @@ namespace Veldrid.Tests
         }
     }
 
+    // Immediate-only on purpose, and not lifted into a shared base over both creators. The assertion is that
+    // a second recorder is refused, and that is true only when the command lists share the one immediate
+    // context. In deferred mode each command list owns its own context and any number of them may be open at
+    // once, which is the opposite assertion, so the deferred half of the contract is guarded separately by
+    // D3D11DeferredRecordingTests below.
     [Trait("Backend", "D3D11ImmediateContext")]
     public class D3D11ImmediateContextRecordingTests : GraphicsDeviceTestBase<D3D11ImmediateContextDeviceCreator>
     {
         private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(5);
+        private const uint ValueCount = 64;
+        private const uint Sentinel = 0xDEADBEEF;
 
         [Fact]
         public void DoubleBeginThrowsAndDoesNotLeakTheRecordingLock()
@@ -235,6 +242,141 @@ namespace Veldrid.Tests
             GD.WaitForIdle();
         }
 
+        [Fact]
+        public void SecondBeginWhileAnotherCommandListRecordsThrowsAndLeavesItRecording()
+        {
+            ComputeCopy copy = CreateComputeCopy();
+            uint[] expected = SeedComputeCopy(copy, 1);
+
+            CommandList open = RF.CreateCommandList();
+            CommandList second = RF.CreateCommandList();
+
+            open.Begin();
+            open.SetPipeline(copy.Pipeline);
+            open.SetComputeResourceSet(0, copy.Set);
+
+            // The bindings above are on the live immediate context, which this second command list shares.
+            // Its Begin used to run ClearState on that context, so the dispatch below then ran with nothing
+            // bound and left the sentinel in place, with nothing said anywhere.
+            VeldridException refused = Assert.Throws<VeldridException>(() => second.Begin());
+            Assert.Contains("UseImmediateContext", refused.Message);
+
+            // The refusal cost the open recorder nothing. It still holds the context, and the set it bound
+            // before the refusal still reaches this dispatch.
+            open.Dispatch(ValueCount, 1, 1);
+            open.End();
+            GD.SubmitCommands(open);
+            GD.WaitForIdle();
+            AssertCopied(expected, copy.Dst);
+
+            // A refused Begin is not a poisoned command list either. With the context free the same instance
+            // records normally.
+            uint[] secondExpected = SeedComputeCopy(copy, 1000);
+            second.Begin();
+            second.SetPipeline(copy.Pipeline);
+            second.SetComputeResourceSet(0, copy.Set);
+            second.Dispatch(ValueCount, 1, 1);
+            second.End();
+            GD.SubmitCommands(second);
+            GD.WaitForIdle();
+            AssertCopied(secondExpected, copy.Dst);
+
+            AssertImmediateContextIsFree();
+        }
+
+        [Fact]
+        public void DisposingANeverBegunCommandListWhileAnotherRecordsLeavesItRecording()
+        {
+            ComputeCopy copy = CreateComputeCopy();
+            uint[] expected = SeedComputeCopy(copy, 7);
+
+            CommandList open = RF.CreateCommandList();
+            CommandList neverBegun = RF.CreateCommandList();
+
+            open.Begin();
+            open.SetPipeline(copy.Pipeline);
+            open.SetComputeResourceSet(0, copy.Set);
+
+            // Dispose runs Reset, which is the same path a Swapchain resize takes. On a command list that
+            // never began, it has to leave the shared context alone: no ClearState, and no release of a
+            // recording it does not hold.
+            neverBegun.Dispose();
+
+            open.Dispatch(ValueCount, 1, 1);
+            open.End();
+            GD.SubmitCommands(open);
+            GD.WaitForIdle();
+            AssertCopied(expected, copy.Dst);
+
+            AssertImmediateContextIsFree();
+        }
+
+        private readonly struct ComputeCopy
+        {
+            public readonly DeviceBuffer Src;
+            public readonly DeviceBuffer Dst;
+            public readonly ResourceSet Set;
+            public readonly Pipeline Pipeline;
+
+            public ComputeCopy(DeviceBuffer src, DeviceBuffer dst, ResourceSet set, Pipeline pipeline)
+            {
+                Src = src;
+                Dst = dst;
+                Set = set;
+                Pipeline = pipeline;
+            }
+        }
+
+        // A compute copy of Src into Dst. The point of using one rather than a bare throw assertion is that
+        // the set can be bound before the refused Begin and consumed by a dispatch after it, so a ClearState
+        // slipped in between shows up as the sentinel surviving in Dst.
+        private ComputeCopy CreateComputeCopy()
+        {
+            uint sizeInBytes = ValueCount * sizeof(uint);
+
+            DeviceBuffer copySrc = RF.CreateBuffer(
+                new BufferDescription(sizeInBytes, BufferUsage.StructuredBufferReadOnly, sizeof(uint), true));
+            DeviceBuffer copyDst = RF.CreateBuffer(
+                new BufferDescription(sizeInBytes, BufferUsage.StructuredBufferReadWrite, sizeof(uint), true));
+
+            ResourceLayout layout = RF.CreateResourceLayout(new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription("CopySrc", ResourceKind.StructuredBufferReadOnly, ShaderStages.Compute),
+                new ResourceLayoutElementDescription("CopyDst", ResourceKind.StructuredBufferReadWrite, ShaderStages.Compute)));
+
+            ResourceSet set = RF.CreateResourceSet(new ResourceSetDescription(layout, copySrc, copyDst));
+
+            Pipeline pipeline = RF.CreateComputePipeline(new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "FillBuffer"), layout, 1, 1, 1));
+
+            return new ComputeCopy(copySrc, copyDst, set, pipeline);
+        }
+
+        private uint[] SeedComputeCopy(ComputeCopy copy, uint firstValue)
+        {
+            uint[] srcData = new uint[ValueCount];
+            uint[] dstData = new uint[ValueCount];
+            for (uint i = 0; i < ValueCount; i++)
+            {
+                srcData[i] = firstValue + i;
+                dstData[i] = Sentinel;
+            }
+
+            GD.UpdateBuffer(copy.Src, 0, srcData);
+            GD.UpdateBuffer(copy.Dst, 0, dstData);
+            return srcData;
+        }
+
+        private void AssertCopied(uint[] expected, DeviceBuffer dst)
+        {
+            DeviceBuffer readback = GetReadback(dst);
+            MappedResourceView<uint> readView = GD.Map<uint>(readback, MapMode.Read);
+            for (uint i = 0; i < ValueCount; i++)
+            {
+                Assert.Equal(expected[i], readView[i]);
+            }
+            GD.Unmap(readback);
+        }
+
         // The recording lock is reentrant, so probing it on the recording thread would succeed even with a
         // leaked recursion. Probe from another thread, with a timeout, so a leak fails rather than hangs.
         private void AssertImmediateContextIsFree()
@@ -246,6 +388,49 @@ namespace Veldrid.Tests
                 update.Wait(ProbeTimeout),
                 "A device-level UpdateBuffer from another thread is still blocked on the immediate-context "
                 + "recording lock, so the lock was left held after SubmitCommands.");
+        }
+    }
+
+    // The other half of the one-recorder rule: deferred mode must keep allowing what immediate mode now
+    // refuses. Each command list has its own deferred context there, so several being open at once is
+    // ordinary use, and nothing about the immediate-mode guard may reach this path.
+    [Trait("Backend", "D3D11")]
+    public class D3D11DeferredRecordingTests : GraphicsDeviceTestBase<D3D11DeviceCreator>
+    {
+        [Fact]
+        public void TwoCommandListsCanBeOpenAtOnce()
+        {
+            DeviceBuffer first = RF.CreateBuffer(new BufferDescription(16, BufferUsage.UniformBuffer));
+            DeviceBuffer second = RF.CreateBuffer(new BufferDescription(16, BufferUsage.UniformBuffer));
+
+            CommandList firstCl = RF.CreateCommandList();
+            CommandList secondCl = RF.CreateCommandList();
+
+            firstCl.Begin();
+            secondCl.Begin();
+
+            firstCl.UpdateBuffer(first, 0, new uint[] { 1, 2, 3, 4 });
+            secondCl.UpdateBuffer(second, 0, new uint[] { 5, 6, 7, 8 });
+
+            firstCl.End();
+            secondCl.End();
+            GD.SubmitCommands(firstCl);
+            GD.SubmitCommands(secondCl);
+            GD.WaitForIdle();
+
+            AssertContents(new uint[] { 1, 2, 3, 4 }, first);
+            AssertContents(new uint[] { 5, 6, 7, 8 }, second);
+        }
+
+        private void AssertContents(uint[] expected, DeviceBuffer buffer)
+        {
+            DeviceBuffer readback = GetReadback(buffer);
+            MappedResourceView<uint> readView = GD.Map<uint>(readback, MapMode.Read);
+            for (int i = 0; i < expected.Length; i++)
+            {
+                Assert.Equal(expected[i], readView[i]);
+            }
+            GD.Unmap(readback);
         }
     }
 #endif

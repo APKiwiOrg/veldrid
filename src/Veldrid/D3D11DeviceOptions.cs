@@ -54,6 +54,15 @@ namespace Veldrid
         /// in both modes.
         /// </para>
         /// <para>
+        /// One recorder at a time. Every <see cref="CommandList"/> on the device records into the same
+        /// immediate context, so only one of them can be open. <see cref="CommandList.Begin"/> on a second
+        /// <see cref="CommandList"/> throws <see cref="VeldridException"/> while another one is open, rather
+        /// than clearing the state that one has already bound. The open recorder is unaffected by the refusal
+        /// and carries on, and the refused <see cref="CommandList"/> can begin normally once the open one has
+        /// reached <see cref="GraphicsDevice.SubmitCommands(CommandList)"/>. Deferred mode has a context per
+        /// <see cref="CommandList"/> and keeps allowing any number of them open at once.
+        /// </para>
+        /// <para>
         /// Resizing. <see cref="Swapchain.Resize(uint, uint)"/> runs on the immediate context and disposes the
         /// <see cref="Framebuffer"/> the recording thread has bound, so resize between frames, never during
         /// one. A resize during recording no longer corrupts the frame or throws from lock misuse, but the

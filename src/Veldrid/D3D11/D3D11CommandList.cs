@@ -125,14 +125,19 @@ namespace Veldrid.D3D11
                     "CommandList must be in its initial state, or End() must have been called, for Begin() to be valid to call.");
             }
 
-            _commandList?.Dispose();
-            _commandList = null;
+            // Everything that can refuse this Begin runs before anything is touched. In immediate mode
+            // _context is the device's live immediate context, shared with every other command list, so the
+            // ClearState further down would wipe whatever another command list has already bound. Nothing
+            // below this block may run until the recording is known to be ours.
             if (_usesImmediateContext)
             {
                 int recordingThreadId = _recordingThreadId;
                 if (recordingThreadId == 0)
                 {
-                    _gd.BeginImmediateContextRecording();
+                    // Throws when another command list holds the recording. It claims the recording before
+                    // taking any lock, so a refusal here leaves this command list exactly as it was and the
+                    // open recorder untouched and still recording.
+                    _gd.BeginImmediateContextRecording(this);
                     _recordingThreadId = Environment.CurrentManagedThreadId;
                 }
                 else if (recordingThreadId != Environment.CurrentManagedThreadId)
@@ -147,6 +152,9 @@ namespace Veldrid.D3D11
                 // lock a second time: the extra recursion outlives the single matching Exit at SubmitCommands
                 // and leaves every other thread blocked on the immediate context forever.
             }
+
+            _commandList?.Dispose();
+            _commandList = null;
 
             try
             {
@@ -1653,7 +1661,7 @@ namespace Veldrid.D3D11
             // Release first, then clear the owner. Monitor.Exit only throws when this thread does not hold
             // the lock, and in that case the field has to keep naming the thread that does, so the real owner
             // can still release it. Clearing first would strand the lock held with nothing left to release it.
-            _gd.EndImmediateContextRecording();
+            _gd.EndImmediateContextRecording(this);
             _recordingThreadId = 0;
         }
 
