@@ -61,12 +61,12 @@ namespace Veldrid.D3D11
         // the set was just bound, or because it was invalidated when another set bound an incompatible SRV or
         // UAV. Dirty slots are flushed at the next draw, so a slot rebound several times between two draws
         // costs one fan-out rather than one per rebind, and a set bound and then replaced costs none.
-        private bool[] _dirtyGraphicsResourceSets = new bool[1];
+        private ResourceSetDirtyState[] _dirtyGraphicsResourceSets = new ResourceSetDirtyState[1];
 
         private new D3D11Pipeline _computePipeline;
         private BoundResourceSetInfo[] _computeResourceSets = new BoundResourceSetInfo[1];
         // As above, flushed at the next dispatch instead of the next draw.
-        private bool[] _dirtyComputeResourceSets = new bool[1];
+        private ResourceSetDirtyState[] _dirtyComputeResourceSets = new ResourceSetDirtyState[1];
         private string _name;
         private bool _vertexBindingsChanged;
         private ID3D11Buffer[] _cbOut = new ID3D11Buffer[1];
@@ -440,7 +440,7 @@ namespace Veldrid.D3D11
         // vkCmdBindDescriptorSets to PreDrawCommand.
         private static void RecordResourceSet(
             BoundResourceSetInfo[] sets,
-            bool[] dirty,
+            ResourceSetDirtyState[] dirty,
             uint slot,
             ResourceSet set,
             uint dynamicOffsetsCount,
@@ -448,25 +448,39 @@ namespace Veldrid.D3D11
         {
             if (sets[slot].Equals(set, dynamicOffsetsCount, ref dynamicOffsets))
             {
-                // Nothing changed, so there is nothing new to record. Note this leaves the dirty flag alone:
-                // an earlier bind of this same slot may still be waiting for its flush, and clearing the flag
-                // here would drop that binding on the floor.
+                // Nothing changed, so there is nothing new to record. Note this leaves the dirty state alone:
+                // an earlier bind of this same slot may still be waiting for its flush, and clearing it here
+                // would drop that binding on the floor.
                 return;
             }
 
+            // The same set with the same number of offsets, reaching here, can only differ in the offset
+            // values, so everything in it that does not read an offset is already on the device and can stay
+            // there. That does not hold while a full fan-out is still pending for the slot: that set has never
+            // reached the device at all, and the cheap path would bind its buffers and leave its textures,
+            // samplers and fixed-range views unbound.
+            bool offsetsOnly = sets[slot].Set == set
+                && sets[slot].Offsets.Count == dynamicOffsetsCount
+                && dirty[slot] != ResourceSetDirtyState.Full;
+
             sets[slot].Offsets.Dispose();
             sets[slot] = new BoundResourceSetInfo(set, dynamicOffsetsCount, ref dynamicOffsets);
-            dirty[slot] = true;
+            dirty[slot] = offsetsOnly ? ResourceSetDirtyState.DynamicOffsetsOnly : ResourceSetDirtyState.Full;
         }
 
         // Pushes every set the device has still to hear about. Called from the draw and dispatch paths, so it
         // always runs on the recording thread inside the Begin..End window, under whatever immediate-context
         // lock that thread already holds.
-        private void FlushResourceSets(BoundResourceSetInfo[] sets, bool[] dirty, int resourceSetCount, bool graphics)
+        private void FlushResourceSets(
+            BoundResourceSetInfo[] sets,
+            ResourceSetDirtyState[] dirty,
+            int resourceSetCount,
+            bool graphics)
         {
             for (uint i = 0; i < resourceSetCount; i++)
             {
-                if (!dirty[i])
+                ResourceSetDirtyState state = dirty[i];
+                if (state == ResourceSetDirtyState.Clean)
                 {
                     continue;
                 }
@@ -474,8 +488,15 @@ namespace Veldrid.D3D11
                 // Clear before activating, never after. Activating a set can unbind an SRV or a UAV that
                 // another set owns, which marks that set dirty again, and a set that is its own victim has to
                 // keep that mark for the next draw rather than have it wiped by this one.
-                dirty[i] = false;
-                ActivateResourceSet(i, sets[i], graphics);
+                dirty[i] = ResourceSetDirtyState.Clean;
+                if (state == ResourceSetDirtyState.DynamicOffsetsOnly)
+                {
+                    ActivateResourceSetDynamicOffsets(i, sets[i], graphics);
+                }
+                else
+                {
+                    ActivateResourceSet(i, sets[i], graphics);
+                }
             }
         }
 
@@ -543,6 +564,68 @@ namespace Veldrid.D3D11
             }
         }
 
+        // The cheap half of ActivateResourceSet, for a set that is already on the device and has only had its
+        // dynamic offsets changed. Only the bindings that read an offset are pushed again, so the textures,
+        // the samplers and the fixed-range buffers of the set are left exactly where they are. For the usual
+        // set, whose dynamic bindings are all uniform buffers, that is one constant buffer call per buffer per
+        // stage and nothing else.
+        private void ActivateResourceSetDynamicOffsets(uint slot, BoundResourceSetInfo brsi, bool graphics)
+        {
+            D3D11ResourceSet d3d11RS = Util.AssertSubtype<ResourceSet, D3D11ResourceSet>(brsi.Set);
+
+            int cbBase = GetConstantBufferBase(slot, graphics);
+            int uaBase = GetUnorderedAccessBase(slot, graphics);
+            int textureBase = GetTextureBase(slot, graphics);
+
+            D3D11ResourceLayout layout = d3d11RS.Layout;
+            BindableResource[] resources = d3d11RS.Resources;
+            uint dynamicOffsetIndex = 0;
+            for (int i = 0; i < resources.Length; i++)
+            {
+                if (!layout.IsDynamicBuffer(i))
+                {
+                    continue;
+                }
+
+                // Offsets are stored in the order the dynamic elements appear in the layout, so the index
+                // advances on dynamic elements only. That is the same walk ActivateResourceSet does, just with
+                // the elements that cannot move skipped instead of rebound.
+                uint bufferOffset = brsi.Offsets.Get(dynamicOffsetIndex);
+                dynamicOffsetIndex += 1;
+
+                BindableResource resource = resources[i];
+                D3D11ResourceLayout.ResourceBindingInfo rbi = layout.GetDeviceSlotIndex(i);
+                switch (rbi.Kind)
+                {
+                    case ResourceKind.UniformBuffer:
+                        {
+                            D3D11BufferRange range = GetBufferRange(resource, bufferOffset);
+                            BindUniformBuffer(range, cbBase + rbi.Slot, rbi.Stages);
+                            break;
+                        }
+                    case ResourceKind.StructuredBufferReadOnly:
+                        {
+                            D3D11BufferRange range = GetBufferRange(resource, bufferOffset);
+                            BindStorageBufferView(range, textureBase + rbi.Slot, rbi.Stages);
+                            break;
+                        }
+                    case ResourceKind.StructuredBufferReadWrite:
+                        {
+                            D3D11BufferRange range = GetBufferRange(resource, bufferOffset);
+                            ID3D11UnorderedAccessView uav = range.Buffer.GetUnorderedAccessView(range.Offset, range.Size);
+                            BindUnorderedAccessView(null, range.Buffer, uav, uaBase + rbi.Slot, rbi.Stages, slot);
+                            break;
+                        }
+                    default:
+                        // Only a buffer binding reads a dynamic offset. ResourceLayout counts a texture or a
+                        // sampler flagged DynamicBinding towards its dynamic count, and ActivateResourceSet
+                        // consumes that element's offset and then ignores it, so there is nothing for the
+                        // offsets-only path to do with one either.
+                        break;
+                }
+            }
+        }
+
         private D3D11BufferRange GetBufferRange(BindableResource resource, uint additionalOffset)
         {
             if (resource is D3D11Buffer d3d11Buff)
@@ -571,14 +654,16 @@ namespace Veldrid.D3D11
                     BindTextureView(null, bti.Slot, bti.Stages, 0);
 
                     // Mark the set dirty rather than re-running its fan-out here. The next draw or dispatch
-                    // flushes it, which also collapses a run of unbinds that hit the same set into one.
+                    // flushes it, which also collapses a run of unbinds that hit the same set into one. It
+                    // has to be a Full mark: an SRV of that set has just been nulled, and only the full
+                    // fan-out binds it again. Full is the top state, so this can never demote a slot.
                     if ((bti.Stages & ShaderStages.Compute) == ShaderStages.Compute)
                     {
-                        _dirtyComputeResourceSets[bti.ResourceSet] = true;
+                        _dirtyComputeResourceSets[bti.ResourceSet] = ResourceSetDirtyState.Full;
                     }
                     else
                     {
-                        _dirtyGraphicsResourceSets[bti.ResourceSet] = true;
+                        _dirtyGraphicsResourceSets[bti.ResourceSet] = ResourceSetDirtyState.Full;
                     }
                 }
 
@@ -602,13 +687,16 @@ namespace Veldrid.D3D11
                 foreach (BoundTextureInfo bti in btis)
                 {
                     BindUnorderedAccessView(null, null, null, bti.Slot, bti.Stages, bti.ResourceSet);
+
+                    // Full, for the same reason as the SRV unbind above: the UAV of that set is gone and only
+                    // the full fan-out puts it back.
                     if ((bti.Stages & ShaderStages.Compute) == ShaderStages.Compute)
                     {
-                        _dirtyComputeResourceSets[bti.ResourceSet] = true;
+                        _dirtyComputeResourceSets[bti.ResourceSet] = ResourceSetDirtyState.Full;
                     }
                     else
                     {
-                        _dirtyGraphicsResourceSets[bti.ResourceSet] = true;
+                        _dirtyGraphicsResourceSets[bti.ResourceSet] = ResourceSetDirtyState.Full;
                     }
                 }
 
@@ -1519,6 +1607,17 @@ namespace Veldrid.D3D11
 
                 _disposed = true;
             }
+        }
+
+        // How much of a bound resource set the device has still to be told about. Ordered by cost, so a slot
+        // can only ever be moved up this list before its flush: a set that needs a full fan-out must never
+        // fall back to the offsets-only path, which would push its buffers and leave its textures unbound.
+        // Clean is 0 so that Util.ClearArray leaves the array in the "nothing pending" state.
+        private enum ResourceSetDirtyState : byte
+        {
+            Clean = 0,
+            DynamicOffsetsOnly = 1,
+            Full = 2,
         }
 
         private struct BoundTextureInfo
