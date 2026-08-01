@@ -937,7 +937,7 @@ namespace Veldrid.D3D11
                     list = GetNewOrCachedBoundTextureInfoList();
                     _boundSRVs.Add(texView.Target, list);
                 }
-                list.Add(new BoundTextureInfo { Slot = slot, Stages = stages, ResourceSet = resourceSet });
+                RecordBoundTexture(list, slot, stages, resourceSet);
             }
 
             if ((stages & ShaderStages.Vertex) == ShaderStages.Vertex)
@@ -996,6 +996,24 @@ namespace Veldrid.D3D11
             {
                 _context.CSSetShaderResource(slot, srv);
             }
+        }
+
+        // Records that a texture is bound at one place, once. The list used to be appended to on every bind,
+        // so rebinding the same texture in the same slot grew it for the whole frame and every unbind walked
+        // all of it, which made a frame's worth of binds and unbinds quadratic. Collapsing the repeats does
+        // not change what an unbind does, since a duplicate record only ever nulled the same slot twice.
+        private static void RecordBoundTexture(List<BoundTextureInfo> list, int slot, ShaderStages stages, uint resourceSet)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                BoundTextureInfo existing = list[i];
+                if (existing.Slot == slot && existing.Stages == stages && existing.ResourceSet == resourceSet)
+                {
+                    return;
+                }
+            }
+
+            list.Add(new BoundTextureInfo { Slot = slot, Stages = stages, ResourceSet = resourceSet });
         }
 
         private List<BoundTextureInfo> GetNewOrCachedBoundTextureInfoList()
@@ -1203,7 +1221,7 @@ namespace Veldrid.D3D11
                     list = GetNewOrCachedBoundTextureInfoList();
                     _boundUAVs.Add(texture, list);
                 }
-                list.Add(new BoundTextureInfo { Slot = slot, Stages = stages, ResourceSet = resourceSet });
+                RecordBoundTexture(list, slot, stages, resourceSet);
             }
 
             int baseSlot = 0;
@@ -1231,6 +1249,18 @@ namespace Veldrid.D3D11
         private void TrackBoundUAVBuffer(DeviceBuffer buffer, int slot, bool compute)
         {
             List<(DeviceBuffer, int)> list = compute ? _boundComputeUAVBuffers : _boundOMUAVBuffers;
+
+            // Same rule as the bound textures above, and it matters more now that an offsets-only rebind can
+            // push a read-write structured buffer again without the rest of its set. UnbindUAVBufferIndividual
+            // removes every entry for the buffer either way, so one record per slot is all it can use.
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i].Item1 == buffer && list[i].Item2 == slot)
+                {
+                    return;
+                }
+            }
+
             list.Add((buffer, slot));
         }
 
