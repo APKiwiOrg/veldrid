@@ -322,6 +322,24 @@ namespace Veldrid.D3D11
             if (!pipeline.IsComputePipeline && _graphicsPipeline != pipeline)
             {
                 D3D11Pipeline d3dPipeline = Util.AssertSubtype<Pipeline, D3D11Pipeline>(pipeline);
+
+                // Drain first, and before the field below moves, because the device slots a pending set
+                // fans out to are read from the OUTGOING pipeline's ResourceLayouts. ClearSets then drops
+                // the records as it always has, leaving the device holding the bindings. Before the fan-out
+                // was deferred this fell out for free: a set was already on the device by the time it got
+                // here, and only its CPU-side record died here. Skipping the drain instead would mean a set
+                // bound and not yet drawn with is silently discarded by a pipeline switch, which two
+                // pipelines sharing their layouts and differing only in blend or depth state would render
+                // as a missing binding rather than as an error.
+                if (_graphicsPipeline != null)
+                {
+                    FlushResourceSets(
+                        _graphicsResourceSets,
+                        _dirtyGraphicsResourceSets,
+                        _graphicsPipeline.ResourceLayouts.Length,
+                        true);
+                }
+
                 _graphicsPipeline = d3dPipeline;
                 ClearSets(_graphicsResourceSets); // Invalidate resource set bindings -- they may be invalid.
                 Util.ClearArray(_dirtyGraphicsResourceSets);
@@ -414,6 +432,18 @@ namespace Veldrid.D3D11
             else if (pipeline.IsComputePipeline && _computePipeline != pipeline)
             {
                 D3D11Pipeline d3dPipeline = Util.AssertSubtype<Pipeline, D3D11Pipeline>(pipeline);
+
+                // Drain the outgoing pipeline's pending sets first, for the reason given on the graphics
+                // side above.
+                if (_computePipeline != null)
+                {
+                    FlushResourceSets(
+                        _computeResourceSets,
+                        _dirtyComputeResourceSets,
+                        _computePipeline.ResourceLayouts.Length,
+                        false);
+                }
+
                 _computePipeline = d3dPipeline;
                 ClearSets(_computeResourceSets); // Invalidate resource set bindings -- they may be invalid.
                 Util.ClearArray(_dirtyComputeResourceSets);
