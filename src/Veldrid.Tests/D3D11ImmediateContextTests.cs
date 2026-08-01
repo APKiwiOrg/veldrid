@@ -91,6 +91,62 @@ namespace Veldrid.Tests
             }
             GD.Unmap(readback);
         }
+
+        // A throw guard, so completing without an exception is the assertion. The sequence walks the backend
+        // into a state where a slot is marked dirty while its record has already been cleared, which the
+        // draining pipeline switch would otherwise try to activate.
+        [Fact]
+        public void PipelineSwitchAfterAFramebufferUnbindsTheSampledTarget()
+        {
+            Texture target = RF.CreateTexture(TextureDescription.Texture2D(
+                32, 32, 1, 1, PixelFormat.B8_G8_R8_A8_UNorm, TextureUsage.Sampled | TextureUsage.RenderTarget));
+            Framebuffer targetFramebuffer = RF.CreateFramebuffer(new FramebufferDescription(null, target));
+
+            ResourceLayout layout = RF.CreateResourceLayout(new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription("Tex", ResourceKind.TextureReadOnly, ShaderStages.Fragment),
+                new ResourceLayoutElementDescription("Smp", ResourceKind.Sampler, ShaderStages.Fragment)));
+
+            ResourceSet samplingSet = RF.CreateResourceSet(new ResourceSetDescription(layout, target, GD.PointSampler));
+
+            ShaderSetDescription shaderSet = new ShaderSetDescription(
+                Array.Empty<VertexLayoutDescription>(),
+                TestShaders.LoadVertexFragment(RF, "FullScreenTriSampleTexture2D"));
+
+            // Two pipelines over the same shaders and the same layout, differing only in blend state, which
+            // is the pairing a real renderer produces and the one where a set stays valid across the switch.
+            GraphicsPipelineDescription gpd = new GraphicsPipelineDescription(
+                BlendStateDescription.SingleOverrideBlend,
+                DepthStencilStateDescription.Disabled,
+                RasterizerStateDescription.Default,
+                PrimitiveTopology.TriangleList,
+                shaderSet,
+                layout,
+                new OutputDescription(null, new OutputAttachmentDescription(PixelFormat.B8_G8_R8_A8_UNorm)));
+            Pipeline first = RF.CreateGraphicsPipeline(ref gpd);
+
+            gpd.BlendState = BlendStateDescription.SingleAlphaBlend;
+            Pipeline second = RF.CreateGraphicsPipeline(ref gpd);
+
+            CommandList cl = RF.CreateCommandList();
+            cl.Begin();
+
+            // Bind the set, then switch. The drain fans the set out, which is what records the texture as
+            // bound at slot 0, and the switch then clears the slot 0 record while that texture record lives on.
+            cl.SetPipeline(first);
+            cl.SetGraphicsResourceSet(0, samplingSet);
+            cl.SetPipeline(second);
+
+            // Binding the same texture as a colour target unbinds it as an SRV, which marks slot 0 dirty by
+            // the surviving texture record, even though slot 0 no longer holds a set.
+            cl.SetFramebuffer(targetFramebuffer);
+
+            // The drain here meets that mark on a cleared record.
+            cl.SetPipeline(first);
+
+            cl.End();
+            GD.SubmitCommands(cl);
+            GD.WaitForIdle();
+        }
     }
 
     [Trait("Backend", "D3D11ImmediateContext")]
