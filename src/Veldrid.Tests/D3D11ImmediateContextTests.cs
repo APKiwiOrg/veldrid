@@ -256,13 +256,18 @@ namespace Veldrid.Tests
             open.SetComputeResourceSet(0, copy.Set);
 
             // The bindings above are on the live immediate context, which this second command list shares.
-            // Its Begin used to run ClearState on that context, so the dispatch below then ran with nothing
-            // bound and left the sentinel in place, with nothing said anywhere.
+            // Its Begin used to run ClearState on that context, so the dispatch below then ran without the
+            // compute shader and left the sentinel in place, with nothing said anywhere.
             VeldridException refused = Assert.Throws<VeldridException>(() => second.Begin());
             Assert.Contains("UseImmediateContext", refused.Message);
 
-            // The refusal cost the open recorder nothing. It still holds the context, and the set it bound
-            // before the refusal still reaches this dispatch.
+            // The refusal cost the open recorder nothing, and the pipeline is what proves it. The resource
+            // set alone would not: its slot is still dirty here, so PreDispatchCommand re-flushes it at the
+            // dispatch and it would survive a foreign ClearState anyway. SetPipelineCore has no such second
+            // chance. It issues CSSetShader only when the pipeline differs from its managed cache, and that
+            // cache belongs to this instance, so another instance clearing the device leaves the cache
+            // saying the shader is bound when it is not. A dispatch with no compute shader writes nothing,
+            // which is the sentinel surviving in Dst.
             open.Dispatch(ValueCount, 1, 1);
             open.End();
             GD.SubmitCommands(open);
@@ -328,8 +333,9 @@ namespace Veldrid.Tests
         }
 
         // A compute copy of Src into Dst. The point of using one rather than a bare throw assertion is that
-        // the set can be bound before the refused Begin and consumed by a dispatch after it, so a ClearState
-        // slipped in between shows up as the sentinel surviving in Dst.
+        // the pipeline can be set before the refused Begin and consumed by a dispatch after it, so a
+        // ClearState slipped in between unbinds the compute shader and shows up as the sentinel surviving
+        // in Dst. See the note at the dispatch for why the pipeline is the detector and the set is not.
         private ComputeCopy CreateComputeCopy()
         {
             uint sizeInBytes = ValueCount * sizeof(uint);

@@ -42,6 +42,12 @@ namespace Veldrid.D3D11
         // reentrant, so the recording thread's own calls pass straight through and land at that point in the
         // command stream rather than ahead of the frame the way deferred mode puts them. See the remarks on
         // D3D11DeviceOptions.UseImmediateContext.
+        //
+        // Recording holds exactly one recursion level, and _immediateRecorder below depends on that. Its
+        // claim is released just before the matching Monitor.Exit, so that exit has to be the one that
+        // actually frees the lock. Releasing the recording from inside a nested hold, a device call made
+        // during the frame for instance, would clear the owner while the lock stayed held and hand the next
+        // Begin a lock nothing names and nothing releases.
         private readonly object _immediateContextLock = new object();
 
         // The D3D11CommandList that currently holds the immediate-context recording, or null when none does.
@@ -283,11 +289,11 @@ namespace Veldrid.D3D11
             if (owner != null && owner != recorder)
             {
                 throw new VeldridException(
-                    "A second CommandList cannot record while the immediate context is captured by an open "
-                    + "Begin(). A CommandList created with D3D11DeviceOptions.UseImmediateContext records "
-                    + "straight into the device's single immediate context, so beginning another one here "
-                    + "would clear the state the open CommandList has already bound. End() and "
-                    + "GraphicsDevice.SubmitCommands() the open CommandList first, or create the "
+                    "A second CommandList cannot record while another one holds the immediate context. A "
+                    + "CommandList created with D3D11DeviceOptions.UseImmediateContext captures that context "
+                    + "at Begin() and holds it until GraphicsDevice.SubmitCommands(), End() included, and it "
+                    + "records straight into it, so beginning another one here would clear the state the "
+                    + "holder has already bound. Submit the open CommandList first, or create the "
                     + "GraphicsDevice without D3D11DeviceOptions.UseImmediateContext to record command lists "
                     + "concurrently on deferred contexts.");
             }
@@ -298,14 +304,26 @@ namespace Veldrid.D3D11
             // here when its own guard says it holds nothing.
             Debug.Assert(owner == null, "The immediate-context recording was claimed twice by one CommandList.");
 
+            // The ref-bool overload, never the bare one. A ThreadInterruptedException can be delivered after
+            // the lock has been acquired, and the bare overload reports that as an ordinary throw with no way
+            // to tell the two cases apart. Dropping the claim on a lock this thread is still holding is the
+            // worse half by far: the next Begin would pass the claim and then block on that lock for good,
+            // which is the silent wedge this guard exists to remove. So the claim is only released when the
+            // lock demonstrably was not taken. When it was taken, claim and lock stay together and the next
+            // Begin is refused out loud, naming the recorder that never got going.
+            bool lockTaken = false;
             try
             {
-                Monitor.Enter(_immediateContextLock);
+                Monitor.Enter(_immediateContextLock, ref lockTaken);
             }
             catch
             {
-                // Nothing was entered, so nothing may stay claimed.
-                Interlocked.CompareExchange(ref _immediateRecorder, null, recorder);
+                if (!lockTaken)
+                {
+                    // Nothing was entered, so nothing may stay claimed.
+                    Interlocked.CompareExchange(ref _immediateRecorder, null, recorder);
+                }
+
                 throw;
             }
         }
@@ -324,8 +342,14 @@ namespace Veldrid.D3D11
             catch
             {
                 // Monitor.Exit only throws when this thread does not hold the lock, and then the recording
-                // this field named is still somebody else's and still has to be releasable. Put back exactly
-                // what was taken away, so clearing first cannot strand a held lock with no owner named.
+                // this field named is still somebody else's and still has to be releasable. Put back what was
+                // taken away, so clearing first cannot strand a held lock with no owner named.
+                //
+                // The restore can lose, to a command list that claimed the slot in the gap. That is harmless
+                // and is left alone. A thrown Exit means this thread never held the lock, so the real holder
+                // still has it and still releases it at its own end, and the winner blocks on the lock until
+                // then rather than recording over anything. The field naming the winner is then correct: it
+                // is the next recorder, and it is the one that goes on to release the claim.
                 if (owner == recorder)
                 {
                     Interlocked.CompareExchange(ref _immediateRecorder, recorder, null);
