@@ -200,7 +200,13 @@ namespace Veldrid.MTL
                 ObjectiveCRuntime.release(depthDescriptor.NativePtr);
             }
 
-            DepthClipMode = description.DepthStencilState.DepthTestEnabled ? MTLDepthClipMode.Clip : MTLDepthClipMode.Clamp;
+            // THE RASTERIZER'S OWN FLAG, which is what every other backend reads. Metal has no rasterizer
+            // depth-clip enable, so MTLDepthClipModeClamp IS how it expresses DepthClipEnabled = false, the
+            // same behaviour D3D11's DepthClipEnable = FALSE and Vulkan's depthClampEnable = VK_TRUE give.
+            // Upstream derived this from the DEPTH TEST instead and read RasterizerState.DepthClipEnabled
+            // nowhere at all, so a pipeline running the depth test with clipping disabled clamped on Windows
+            // and Linux and clipped on macOS. KhaozEngine issue 598.
+            DepthClipMode = description.RasterizerState.DepthClipEnabled ? MTLDepthClipMode.Clip : MTLDepthClipMode.Clamp;
         }
 
         public MTLPipeline(ref ComputePipelineDescription description, MTLGraphicsDevice gd)
